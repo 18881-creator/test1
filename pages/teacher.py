@@ -1,206 +1,372 @@
+# teacher.py
 import streamlit as st
 import pandas as pd
-import plotly.express as px
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
 from supabase import create_client, Client
-from datetime import datetime, timedelta
 
-# --------------------------------------------------
-# 1. 초기 설정 및 Supabase 연결
-# --------------------------------------------------
-st.set_page_config(page_title="교사용 대시보드", layout="wide")
+# -----------------------------
+# 기본 설정
+# -----------------------------
+st.set_page_config(
+    page_title="교사용 대시보드",
+    page_icon="📊",
+    layout="wide",
+)
 
+KST = ZoneInfo("Asia/Seoul")
+UTC = timezone.utc
+
+TABLE_NAME = "student_submissions"
+
+# -----------------------------
+# Supabase client
+# -----------------------------
 @st.cache_resource
 def get_supabase_client() -> Client:
-    try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
-        return create_client(url, key)
-    except Exception:
-        st.error("Secrets 설정이 누락되었습니다. .streamlit/secrets.toml을 확인하세요.")
-        st.stop()
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]  # 서버 전용 (절대 노출 금지)
+    return create_client(url, key)
 
-supabase = get_supabase_client()
+# -----------------------------
+# (선택) 간단 교사용 비밀번호 보호
+# - secrets.toml에 TEACHER_PASSWORD를 넣으면 작동
+# - 없으면 보호 없이 열림
+# -----------------------------
+def teacher_gate():
+    pw = st.secrets.get("TEACHER_PASSWORD", None)
+    if not pw:
+        return True  # 비번 설정 안 하면 그냥 통과
 
-# --------------------------------------------------
-# 2. 데이터 로드 및 전처리 함수
-# --------------------------------------------------
-def load_data():
-    """Supabase에서 데이터를 가져와 Pandas DataFrame으로 변환합니다."""
-    try:
-        # student_submissions 테이블의 모든 데이터 조회
-        response = supabase.table("student_submissions").select("*").execute()
-        rows = response.data
-        
-        if not rows:
-            return pd.DataFrame()
+    if "teacher_authed" not in st.session_state:
+        st.session_state.teacher_authed = False
 
-        df = pd.DataFrame(rows)
+    if st.session_state.teacher_authed:
+        return True
 
-        # 날짜 형식 변환 (UTC -> KST 변환 예시)
-        if "created_at" in df.columns:
-            df["created_at"] = pd.to_datetime(df["created_at"])
-            # 한국 시간(KST)으로 변환 (UTC+9)
-            df["created_at"] = df["created_at"] + timedelta(hours=9)
-            df["제출시간"] = df["created_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
-        
-        return df
-    except Exception as e:
-        st.error(f"데이터 로드 중 오류 발생: {e}")
+    st.sidebar.subheader("🔐 교사용 로그인")
+    input_pw = st.sidebar.text_input("비밀번호", type="password")
+    if st.sidebar.button("로그인"):
+        if input_pw == pw:
+            st.session_state.teacher_authed = True
+            st.sidebar.success("로그인 완료")
+            st.rerun()
+        else:
+            st.sidebar.error("비밀번호가 틀렸습니다.")
+    st.stop()
+
+teacher_gate()
+
+# -----------------------------
+# 데이터 불러오기
+# -----------------------------
+@st.cache_data(ttl=30)
+def fetch_rows(limit: int = 2000):
+    """최근 limit개를 가져옵니다. (필요 시 페이지네이션 확장 가능)"""
+    supabase = get_supabase_client()
+    # created_at 내림차순
+    res = (
+        supabase.table(TABLE_NAME)
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    data = res.data or []
+    return data
+
+def to_df(rows: list) -> pd.DataFrame:
+    if not rows:
         return pd.DataFrame()
 
-def parse_ox(feedback_text):
-    """피드백 텍스트(O: ... / X: ...)에서 정오답 여부를 추출합니다."""
-    if not isinstance(feedback_text, str):
-        return "판정불가"
-    clean_text = feedback_text.strip()
-    if clean_text.startswith("O") or clean_text.startswith("O:"):
-        return "정답(O)"
-    elif clean_text.startswith("X") or clean_text.startswith("X:"):
-        return "오답(X)"
-    else:
-        return "판정불가"
+    df = pd.DataFrame(rows)
 
-# --------------------------------------------------
-# 3. 메인 화면 구성
-# --------------------------------------------------
-st.title("📊 과학 수업 서술형 평가 - 교사용 대시보드")
-st.markdown("학생들이 제출한 답안과 AI의 피드백 결과를 실시간으로 모니터링합니다.")
+    # created_at 파싱
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
 
-# 사이드바: 데이터 새로고침
+        # KST 표시용 컬럼
+        df["created_at_kst"] = df["created_at"].dt.tz_convert(KST)
+
+    # 학생 id 문자열로 통일 (검색 편의)
+    if "student_id" in df.columns:
+        df["student_id"] = df["student_id"].astype(str)
+
+    return df
+
+# -----------------------------
+# 피드백 O/X 판정 파싱
+# -----------------------------
+def ox_from_feedback(feedback: str):
+    if not isinstance(feedback, str) or not feedback:
+        return None
+    f = feedback.strip()
+    if f.startswith("O:"):
+        return "O"
+    if f.startswith("X:"):
+        return "X"
+    return None
+
+def build_analytics(df: pd.DataFrame):
+    """문항별 O/X 비율 및 결측 현황"""
+    if df.empty:
+        return None
+
+    stats = []
+    for i in [1, 2, 3]:
+        col = f"feedback_{i}"
+        if col not in df.columns:
+            continue
+
+        ox = df[col].apply(ox_from_feedback)
+        o_cnt = int((ox == "O").sum())
+        x_cnt = int((ox == "X").sum())
+        n = int(ox.notna().sum())
+        missing = int(ox.isna().sum())
+
+        o_rate = (o_cnt / n * 100) if n else 0.0
+        x_rate = (x_cnt / n * 100) if n else 0.0
+
+        stats.append(
+            {
+                "문항": f"Q{i}",
+                "O 개수": o_cnt,
+                "X 개수": x_cnt,
+                "O 비율(%)": round(o_rate, 1),
+                "X 비율(%)": round(x_rate, 1),
+                "판정 불가/결측": missing,
+            }
+        )
+
+    return pd.DataFrame(stats)
+
+# -----------------------------
+# UI 헤더
+# -----------------------------
+st.title("📊 서술형 평가 교사용 대시보드")
+st.caption("학생 제출 내용, GPT 피드백(O/X), 문항별 통계, 검색/필터, CSV 내보내기를 제공합니다.")
+
 with st.sidebar:
-    st.header("설정")
-    if st.button("데이터 새로고침 🔄"):
-        st.cache_data.clear()
-        st.rerun()
-    st.info("Supabase DB와 연동되어 있습니다.")
+    st.header("⚙️ 필터")
+    st.button("🔄 새로고침(캐시 초기화)", on_click=lambda: st.cache_data.clear())
 
-# 데이터 로딩
-df = load_data()
+    # 기간 필터 (기본: 최근 7일)
+    today_kst = datetime.now(KST).date()
+    default_start = today_kst - timedelta(days=7)
+
+    date_range = st.date_input(
+        "기간 (KST 기준)",
+        value=(default_start, today_kst),
+    )
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date, end_date = default_start, today_kst
+
+    student_query = st.text_input("학번 검색(부분 일치)", value="")
+    model_filter = st.text_input("모델 필터(부분 일치)", value="")  # 예: gpt-5-mini
+    only_with_feedback = st.checkbox("피드백 생성된 제출만 보기", value=False)
+
+    st.divider()
+    st.subheader("표시 옵션")
+    show_answers = st.checkbox("표에 답안도 함께 표시", value=False)
+    show_guidelines = st.checkbox("표에 채점 기준도 함께 표시", value=False)
+
+# -----------------------------
+# 데이터 로드 & 필터링
+# -----------------------------
+rows = fetch_rows(limit=2000)
+df = to_df(rows)
 
 if df.empty:
-    st.warning("아직 제출된 데이터가 없습니다. 학생 페이지에서 제출을 진행해주세요.")
+    st.info("아직 저장된 제출 데이터가 없습니다.")
+    st.stop()
+
+# 날짜 필터(KST 기준으로 범위 적용)
+# created_at_kst가 있는 경우 그걸로 필터
+if "created_at_kst" in df.columns:
+    start_dt_kst = datetime.combine(start_date, datetime.min.time(), tzinfo=KST)
+    end_dt_kst = datetime.combine(end_date, datetime.max.time(), tzinfo=KST)
+    mask = (df["created_at_kst"] >= start_dt_kst) & (df["created_at_kst"] <= end_dt_kst)
+    df_f = df.loc[mask].copy()
 else:
-    # ── 데이터 전처리: 정오답 열 추가 ──
-    for i in range(1, 4):
-        df[f"Q{i}_판정"] = df[f"feedback_{i}"].apply(parse_ox)
+    df_f = df.copy()
 
-    # 탭 구성
-    tab1, tab2, tab3 = st.tabs(["📈 종합 통계", "📋 전체 데이터 조회", "🧑‍🎓 학생별 상세 보기"])
+# 학번 검색
+if student_query.strip():
+    q = student_query.strip()
+    df_f = df_f[df_f["student_id"].str.contains(q, na=False)]
 
-    # ==================================================
-    # Tab 1: 종합 통계 (시각화)
-    # ==================================================
-    with tab1:
-        # 1. 상단 지표 (Metrics)
-        col1, col2, col3 = st.columns(3)
-        total_students = df["student_id"].nunique()
-        total_submissions = len(df)
-        
-        # 전체 정답률 계산 (모든 문항 합산)
-        total_q_count = len(df) * 3
-        correct_count = (
-            (df["Q1_판정"] == "정답(O)").sum() + 
-            (df["Q2_판정"] == "정답(O)").sum() + 
-            (df["Q3_판정"] == "정답(O)").sum()
-        )
-        avg_score = round((correct_count / total_q_count) * 100, 1) if total_q_count > 0 else 0
+# 모델 필터
+if model_filter.strip() and "model" in df_f.columns:
+    mq = model_filter.strip().lower()
+    df_f = df_f[df_f["model"].astype(str).str.lower().str.contains(mq, na=False)]
 
-        col1.metric("총 참여 학생 수", f"{total_students}명")
-        col2.metric("총 제출 건수", f"{total_submissions}건")
-        col3.metric("전체 평균 정답률", f"{avg_score}%")
-        
-        st.divider()
+# 피드백 있는 것만
+if only_with_feedback:
+    fb_cols = [c for c in ["feedback_1", "feedback_2", "feedback_3"] if c in df_f.columns]
+    if fb_cols:
+        df_f = df_f[df_f[fb_cols].notna().any(axis=1)]
 
-        # 2. 문항별 정답/오답 비율 그래프
-        st.subheader("문항별 정오답 현황")
-        
-        # 시각화를 위한 데이터 재구조화 (Wide -> Long)
-        ox_counts = []
-        for i in range(1, 4):
-            counts = df[f"Q{i}_판정"].value_counts().reset_index()
-            counts.columns = ["판정", "학생수"]
-            counts["문항"] = f"문항 {i}"
-            ox_counts.append(counts)
-        
-        chart_df = pd.concat(ox_counts)
-        
-        # Plotly 바 차트
-        fig = px.bar(
-            chart_df, 
-            x="문항", 
-            y="학생수", 
-            color="판정", 
-            title="문항별 성취도 분석",
-            text_auto=True,
-            color_discrete_map={"정답(O)": "#2ecc71", "오답(X)": "#e74c3c", "판정불가": "#95a5a6"},
-            category_orders={"판정": ["정답(O)", "오답(X)", "판정불가"]}
-        )
-        st.plotly_chart(fig, use_container_width=True)
+# -----------------------------
+# 상단 KPI
+# -----------------------------
+col1, col2, col3, col4 = st.columns(4)
 
-    # ==================================================
-    # Tab 2: 전체 데이터 조회 (Dataframe)
-    # ==================================================
-    with tab2:
-        st.subheader("전체 제출 내역")
-        st.caption("컬럼 헤더를 클릭하여 정렬하거나, 오른쪽 상단 돋보기를 눌러 검색할 수 있습니다.")
-        
-        # 표시할 컬럼 선택 및 이름 정리
-        display_cols = ["student_id", "제출시간", 
-                        "Q1_판정", "answer_1", "feedback_1",
-                        "Q2_판정", "answer_2", "feedback_2",
-                        "Q3_판정", "answer_3", "feedback_3"]
-        
-        # 데이터프레임 표시
-        st.dataframe(
-            df[display_cols],
-            column_config={
-                "student_id": "학번",
-                "제출시간": "제출 시간",
-                "answer_1": st.column_config.TextColumn("문항1 답안", width="medium"),
-                "feedback_1": st.column_config.TextColumn("문항1 피드백", width="medium"),
-                "answer_2": st.column_config.TextColumn("문항2 답안", width="medium"),
-                "feedback_2": st.column_config.TextColumn("문항2 피드백", width="medium"),
-                "answer_3": st.column_config.TextColumn("문항3 답안", width="medium"),
-                "feedback_3": st.column_config.TextColumn("문항3 피드백", width="medium"),
-            },
-            hide_index=True,
-            use_container_width=True
-        )
+with col1:
+    st.metric("제출 수", f"{len(df_f):,}")
 
-    # ==================================================
-    # Tab 3: 학생별 상세 보기 (Drill-down)
-    # ==================================================
-    with tab3:
-        st.subheader("학생별 상세 피드백 리포트")
-        
-        # 학번 선택 박스
-        student_list = sorted(df["student_id"].unique())
-        selected_student = st.selectbox("학번을 선택하세요", student_list)
-        
-        if selected_student:
-            # 해당 학생의 가장 최근 제출 데이터 가져오기
-            student_data = df[df["student_id"] == selected_student].sort_values("created_at", ascending=False).iloc[0]
-            
-            st.markdown(f"### 👤 학번: {selected_student}")
-            st.caption(f"제출 시간: {student_data['제출시간']}")
-            
-            # 카드 형태로 문항별 상세 내용 표시
-            for i in range(1, 4):
-                with st.container():
-                    st.markdown(f"#### 📝 문항 {i}")
-                    
-                    col_a, col_b = st.columns([1, 1])
-                    
-                    with col_a:
-                        st.markdown("**[학생 답안]**")
-                        st.info(student_data[f"answer_{i}"])
-                    
-                    with col_b:
-                        ox = student_data[f"Q{i}_판정"]
-                        # 정답/오답에 따른 색상 구분
-                        if ox == "정답(O)":
-                            st.success(f"**[AI 피드백]** {student_data[f'feedback_{i}']}")
-                        else:
-                            st.error(f"**[AI 피드백]** {student_data[f'feedback_{i}']}")
-                    
-                    st.divider()
+with col2:
+    uniq_students = df_f["student_id"].nunique() if "student_id" in df_f.columns else 0
+    st.metric("학생 수(중복 제거)", f"{uniq_students:,}")
+
+with col3:
+    # Q1~Q3 중 O 개수 합
+    total_o = 0
+    for i in [1, 2, 3]:
+        c = f"feedback_{i}"
+        if c in df_f.columns:
+            total_o += int(df_f[c].apply(ox_from_feedback).eq("O").sum())
+    st.metric("총 O 판정(합계)", f"{total_o:,}")
+
+with col4:
+    # 최근 제출 시각
+    if "created_at_kst" in df_f.columns:
+        latest = df_f["created_at_kst"].max()
+        st.metric("최근 제출(KST)", latest.strftime("%Y-%m-%d %H:%M") if pd.notna(latest) else "-")
+    else:
+        st.metric("최근 제출", "-")
+
+st.divider()
+
+# -----------------------------
+# 문항별 통계
+# -----------------------------
+st.subheader("📈 문항별 O/X 통계")
+ana = build_analytics(df_f)
+if ana is None or ana.empty:
+    st.info("통계를 만들 수 없습니다(피드백 컬럼/데이터 확인).")
+else:
+    st.dataframe(ana, use_container_width=True)
+
+st.divider()
+
+# -----------------------------
+# 제출 목록 테이블
+# -----------------------------
+st.subheader("🗂️ 제출 목록")
+
+# 표에 보여줄 컬럼 구성
+base_cols = ["created_at_kst", "student_id", "model", "feedback_1", "feedback_2", "feedback_3"]
+answer_cols = ["answer_1", "answer_2", "answer_3"]
+guide_cols = ["guideline_1", "guideline_2", "guideline_3"]
+
+cols = [c for c in base_cols if c in df_f.columns]
+if show_answers:
+    cols += [c for c in answer_cols if c in df_f.columns]
+if show_guidelines:
+    cols += [c for c in guide_cols if c in df_f.columns]
+
+# 정렬(최신순)
+if "created_at_kst" in df_f.columns:
+    df_table = df_f.sort_values("created_at_kst", ascending=False)[cols].copy()
+else:
+    df_table = df_f[cols].copy()
+
+# created_at_kst 보기 좋게 문자열로
+if "created_at_kst" in df_table.columns:
+    df_table["created_at_kst"] = df_table["created_at_kst"].dt.strftime("%Y-%m-%d %H:%M")
+
+st.dataframe(df_table, use_container_width=True, height=420)
+
+# CSV 내보내기
+csv = df_table.to_csv(index=False).encode("utf-8-sig")
+st.download_button(
+    "⬇️ 현재 필터 결과 CSV 다운로드",
+    data=csv,
+    file_name=f"submissions_{start_date}_{end_date}.csv",
+    mime="text/csv",
+)
+
+st.divider()
+
+# -----------------------------
+# 개별 제출 상세 보기
+# -----------------------------
+st.subheader("🔎 개별 제출 상세")
+
+# 선택 UI (학번 기준 최신 제출부터 보여주기)
+# 학번 리스트
+student_ids = sorted(df_f["student_id"].dropna().unique().tolist())
+sel_student = st.selectbox("학번 선택", options=["(선택)"] + student_ids, index=0)
+
+if sel_student != "(선택)":
+    df_s = df_f[df_f["student_id"] == sel_student].copy()
+
+    # 제출 시각 선택(최신 먼저)
+    if "created_at_kst" in df_s.columns:
+        df_s = df_s.sort_values("created_at_kst", ascending=False)
+        options = df_s["created_at_kst"].dt.strftime("%Y-%m-%d %H:%M").fillna("-").tolist()
+        idx_map = {options[i]: df_s.iloc[i] for i in range(len(options))}
+        sel_time = st.selectbox("제출 시각(KST) 선택", options=options)
+        row = idx_map[sel_time]
+    else:
+        row = df_s.iloc[0]
+
+    # 상세 표시
+    left, right = st.columns([1, 1])
+
+    with left:
+        st.markdown("### 🧾 답안")
+        for i in [1, 2, 3]:
+            a = row.get(f"answer_{i}", "")
+            st.markdown(f"**문항 {i} 답안**")
+            st.write(a if isinstance(a, str) and a.strip() else "—")
+
+    with right:
+        st.markdown("### ✅ GPT 피드백 / 기준")
+        for i in [1, 2, 3]:
+            fb = row.get(f"feedback_{i}", "")
+            gd = row.get(f"guideline_{i}", "")
+            tag = ox_from_feedback(fb)
+            if tag == "O":
+                st.success(f"**문항 {i}**  {fb}")
+            elif tag == "X":
+                st.info(f"**문항 {i}**  {fb}")
+            else:
+                st.warning(f"**문항 {i}**  (판정 불가) {fb if fb else '—'}")
+
+            if gd and isinstance(gd, str):
+                with st.expander(f"문항 {i} 채점 기준 보기"):
+                    st.write(gd)
+
+    st.caption(f"모델: {row.get('model','-')}")
+
+st.divider()
+
+# -----------------------------
+# (선택) 학생별 요약 통계
+# -----------------------------
+st.subheader("👥 학생별 요약 (O 개수 기준)")
+
+def count_o_in_row(r):
+    cnt = 0
+    for i in [1, 2, 3]:
+        fb = r.get(f"feedback_{i}", None)
+        if ox_from_feedback(fb) == "O":
+            cnt += 1
+    return cnt
+
+df_sum = df_f.copy()
+df_sum["o_count"] = df_sum.apply(count_o_in_row, axis=1)
+
+# 학생별 최신 제출 1개만 집계(원하면 평균/최대 등으로 바꿀 수 있음)
+if "created_at_kst" in df_sum.columns:
+    df_latest = df_sum.sort_values("created_at_kst", ascending=False).groupby("student_id", as_index=False).first()
+else:
+    df_latest = df_sum.groupby("student_id", as_index=False).first()
+
+df_latest = df_latest[["student_id", "o_count"]].sort_values("o_count", ascending=False)
+
+st.dataframe(df_latest, use_container_width=True, height=320)
